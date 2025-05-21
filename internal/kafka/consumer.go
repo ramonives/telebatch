@@ -32,7 +32,7 @@ func ConsumeAndPersist(db *sql.DB) {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:  []string{"localhost:9092"},
 		Topic:    "telemarketing_lote",
-		GroupID:  "telebatch_consumer_group_final",
+		GroupID:  "telebatch_consumer_batch10k",
 		MinBytes: 1,
 		MaxBytes: 10e6,
 	})
@@ -42,6 +42,42 @@ func ConsumeAndPersist(db *sql.DB) {
 
 	count := 0
 	var lote string
+	var buffer []Ligacao
+	batchSize := 50000
+
+	insertBatch := func(batch []Ligacao) {
+		if len(batch) == 0 {
+			return
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			log.Printf("Erro ao iniciar transação: %v", err)
+			return
+		}
+
+		stmt, err := tx.Prepare(`
+			INSERT INTO chamadas_importadas
+			(nome_cliente, telefone, data_ligacao, duracao_segundos, motivo_ligacao, resolvido, atendente)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`)
+		if err != nil {
+			log.Printf("Erro ao preparar statement: %v", err)
+			return
+		}
+		defer stmt.Close()
+
+		for _, msg := range batch {
+			_, err := stmt.Exec(msg.NomeCliente, msg.Telefone, msg.DataLigacao, msg.DuracaoSegundos, msg.MotivoLigacao, msg.Resolvido, msg.Atendente)
+			if err != nil {
+				log.Printf("Erro ao inserir no batch: %v", err)
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			log.Printf("Erro ao commitar batch: %v", err)
+		}
+	}
 
 	for {
 		m, err := reader.ReadMessage(ctx)
@@ -57,43 +93,38 @@ func ConsumeAndPersist(db *sql.DB) {
 		}
 
 		if msg.Type == "header" {
+			if msg.Lote != "" {
+				lote = msg.Lote
+			}
 			continue
 		}
 
 		if msg.Type == "footer" {
+			// Flush final do que sobrou no buffer
+			insertBatch(buffer)
 			break
 		}
 
-		// ✅ Só define o lote se estiver preenchido
-		if msg.Lote != "" {
+		if msg.Lote != "" && lote == "" {
 			lote = msg.Lote
 		}
 
-		_, err = db.Exec(`
-			INSERT INTO chamadas_importadas
-			(nome_cliente, telefone, data_ligacao, duracao_segundos, motivo_ligacao, resolvido, atendente)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-		`, msg.NomeCliente, msg.Telefone, msg.DataLigacao, msg.DuracaoSegundos, msg.MotivoLigacao, msg.Resolvido, msg.Atendente)
-
-		if err != nil {
-			log.Printf("Erro ao inserir no banco: %v", err)
-			continue
-		}
-
+		buffer = append(buffer, msg)
 		count++
-		if count%100 == 0 {
+
+		if len(buffer) >= batchSize {
+			insertBatch(buffer)
 			log.Printf("✅ %d registros consumidos e inseridos...", count)
+			buffer = buffer[:0] // limpa o buffer
 		}
 	}
 
 	duration := time.Since(start)
-
 	logContent := fmt.Sprintf(
 		"Lote: %s\nTotal processado: %d\nTempo: %s\nData/hora: %s\n",
 		lote, count, duration.String(), time.Now().Format("2006-01-02 15:04:05"),
 	)
 
-	// ✅ Garante nome válido de arquivo
 	filename := fmt.Sprintf("%s-consumo.log", lote)
 	if lote == "" {
 		filename = fmt.Sprintf("lote_undefined_%s-consumo.log", time.Now().Format("15_04_05"))
